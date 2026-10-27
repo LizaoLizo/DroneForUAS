@@ -1,90 +1,172 @@
+#include <cmath>
+#include <iomanip>
 #include <iostream>
+#include <chrono>
 #include <windows.h>
+#include <fstream>
 
 // Link the Windows keyboard library
 #pragma comment(lib, "user32.lib")
 
-// Group the INPUT values. Every key initially starts released
-
-struct KeyboardInput
-{
-    bool a_pressed = false;
-    bool d_pressed = false;
-    bool w_pressed = false;
-    bool s_pressed = false;
-    bool q_pressed = false;
-    bool e_pressed = false;
-    bool enable_pressed = false;
-    bool exit_pressed = false;
-};
-
-// This structure groups three command values together
-struct PyrCommand
-{
-    // Requested altitude angles, in degrees
-    double roll_deg = 0.0;
-    double pitch_deg = 0.0;
-
-    // Requested yaw angular rate, in degrees per second
-    double yaw_rate_deg_s = 0.0;
-};
-
-// Calculate the command for one axis
-// magnitude must be positive; function chooses sign
-
+// Move one number toward a target without passing it.
+// Invalid input returns zero. A zero max_change is valid and preserves current.
+double move_towards(double current, double target, double max_change);
 double axis_command(bool negative_pressed, bool positive_pressed, double magnitude);
-
-// These queries read key states
-KeyboardInput read_keyboard();
-
-// Receive an input object and return an output object
-// inputs used to test logics
-PyrCommand calculate_command(KeyboardInput input);
-
-// Recieve copies of data and display
-void display_command(KeyboardInput input, PyrCommand command);
-
-// Check logic
-
-bool run_logic_checks();
 
 int main()
 {
-    // Display bool value as True / False instead of 1 / 0
-    std::cout << std::boolalpha;
+    std::cout << std::fixed << std::setprecision(2);
+    std::cout << "A/D = Roll, W/S = Pitch, Q/E = Yaw rate. ESC exits.\n";
+    std::cout << "Release keys to ramp toward zero. No Enter is needed.\n";
+    std::cout << "Each pair is OUTPUT / TARGET.\n";
+    std::cout << "Roll/Pitch: deg. Yaw rate: deg/s.\n";
+    std::cout << "These are command values, not aircraft measurements.\n\n";
 
-    // Run checks before the loop
-    if (!run_logic_checks())
+    // Each output remembers its own value between loop iterations.
+    double current_roll = 0.0;
+    double current_pitch = 0.0;
+    double current_yaw_rate = 0.0;
+
+    // Target magnitudes. Yaw uses ANGULAR RATE, not an angle.
+    const double roll_limit_deg = 10.0;
+    const double pitch_limit_deg = 10.0;
+    const double yaw_limit_deg_s = 30.0;
+
+    // Limits on how quickly the COMMAND VALUES may change.
+    const double roll_slew_deg_s = 10.0;
+    const double pitch_slew_deg_s = 10.0;
+    const double yaw_slew_deg_s2 = 60.0;
+
+    // Open one CSV file for this run. A new run replaces the previous log.
+    std::ofstream log_file("keyboard_log.csv", std::ios::trunc);
+    if (!log_file)
     {
-        std::cout << "Logic checks failed. The keyboard loop was not started.\n";
+        std::cerr << "Could not open keyboard_log.csv.\n";
         return 1;
     }
 
-    std::cout << "Hold SPACE to enable command created.\n";
-    std::cout << "While holding SPACE: A/D = roll, W/S = pitch, Q/E = yaw.\n";
-    std::cout << "The unit of ROLL/PITCH: deg. The unit of YAW-RATE: deg/s.\n";
-    std::cout << "Release SPACE to set all three commands to zero.\n";
-    std::cout << "ESC exits.\n\n";
+    // File formatting is separate from the console formatting.
+    log_file << std::fixed << std::setprecision(6);
 
-    // Keep checking the keyboard
+    // Write the column names once, before entering the loop.
+    log_file << "elapsed_s,dt_s,"
+         << "target_roll_deg,output_roll_deg,"
+         << "target_pitch_deg,output_pitch_deg,"
+         << "target_yaw_rate_deg_s,output_yaw_rate_deg_s\n";
+
+    using Clock = std::chrono::steady_clock;
+    const auto start_time = Clock::now();
+    auto previous_time = start_time;
+
     while (true)
     {
-        keyboardInput input = read_keyboard();
-        if (input.exit_pressed)
+        if (GetAsyncKeyState(VK_ESCAPE) < 0)
         {
             break;
         }
 
-        PyrCommand command = calculate_command(input);
-        display_command(input, command);
-        Sleep(50);     // Approximately 50 milliseconds between every updates
- 
+        // Read a new set of physical key states every iteration.
+        bool a_pressed = (GetAsyncKeyState('A') < 0);
+        bool d_pressed = (GetAsyncKeyState('D') < 0);
+        bool w_pressed = (GetAsyncKeyState('W') < 0);
+        bool s_pressed = (GetAsyncKeyState('S') < 0);
+        bool q_pressed = (GetAsyncKeyState('Q') < 0);
+        bool e_pressed = (GetAsyncKeyState('E') < 0);
+
+        // Reuse ONE function to choose three independent targets.
+        double target_roll =
+            axis_command(a_pressed, d_pressed, roll_limit_deg);
+
+        double target_pitch =
+            axis_command(w_pressed, s_pressed, pitch_limit_deg);
+
+        double target_yaw_rate =
+            axis_command(q_pressed, e_pressed, yaw_limit_deg_s);
+
+        // Measure one elapsed interval and use it for all three axes.
+        auto now = Clock::now();
+        double dt = std::chrono::duration<double>(now - previous_time).count();
+        previous_time = now;
+
+        // Convert each command-change rate into a per-update step.
+        double roll_step = roll_slew_deg_s * dt;
+        double pitch_step = pitch_slew_deg_s * dt;
+        double yaw_rate_step = yaw_slew_deg_s2 * dt;
+
+        // Save each new output for the next iteration.
+        current_roll =
+            move_towards(current_roll, target_roll, roll_step);
+
+        current_pitch =
+            move_towards(current_pitch, target_pitch, pitch_step);
+
+        current_yaw_rate =
+            move_towards(current_yaw_rate, target_yaw_rate, yaw_rate_step);
+
+        // Record the result of THIS update after applying smoothing.
+    double elapsed =
+        std::chrono::duration<double>(now - start_time).count();
+
+    log_file << elapsed << ',' << dt << ','
+         << target_roll << ',' << current_roll << ','
+         << target_pitch << ',' << current_pitch << ','
+         << target_yaw_rate << ',' << current_yaw_rate << '\n';
+
+    if (!log_file)
+    {
+        std::cerr << "\nCould not write the CSV log.\n";
+        return 1;
+    }  
+
+        std::cout << "\rRoll " << std::setw(6) << current_roll
+                  << '/' << std::setw(6) << target_roll
+                  << " | Pitch " << std::setw(6) << current_pitch
+                  << '/' << std::setw(6) << target_pitch
+                  << " | Yaw " << std::setw(6) << current_yaw_rate
+                  << '/' << std::setw(6) << target_yaw_rate
+                  << "        " << std::flush;
+
+        Sleep(50);
     }
 
-    std::cout << "\nProgram Stopped.\n";
+    // Finish buffered writes and check for a closing error
+    log_file.close();
+    if (!log_file)
+    {
+        std::cerr << "\nCould not finish writing the CSV log.\n";
+        return 1;
+    }
+
+    std::cout << "\nSaved keyboard_log.csv in the working folder.\n";
+    std::cout << "Program stopped.\n";
     return 0;
 }
 
+double move_towards(double current, double target, double max_change)
+{
+    if (!std::isfinite(current) || !std::isfinite(target) ||
+        !std::isfinite(max_change) || max_change < 0.0)
+    {
+        return 0.0;
+    }
+
+    double difference = target - current;
+    if (difference > max_change)
+    {
+        return current + max_change;
+    }
+    else if (difference < -max_change)
+    {
+        return current - max_change;
+    }
+    else
+    {
+        return target;
+    }
+}
+
+// Convert one pair of opposite keys into a target value.
+// The caller chooses the positive magnitude and its units.
 double axis_command(bool negative_pressed, bool positive_pressed, double magnitude)
 {
     if (negative_pressed && !positive_pressed)
@@ -97,77 +179,8 @@ double axis_command(bool negative_pressed, bool positive_pressed, double magnitu
     }
     else
     {
+        // Neither key or both keys requests zero.
         return 0.0;
     }
 }
 
-KeyboardInput read_keyboard()
-{
-    KeyboardInput input;
-    input.a_pressed = (GetAsyncKeyState('A') < 0);
-    input.d_pressed = (GetAsyncKeyState('D') < 0);
-    input.w_pressed = (GetAsyncKeyState('W') < 0);
-    input.s_pressed = (GetAsyncKeyState('S') < 0);
-    input.q_pressed = (GetAsyncKeyState('Q') < 0);
-    input.enable_pressed = (GetAsyncKeyState(VK_SPACE) < 0);
-    input.exit_pressed = (GetAstncKeyState(VK_ESCAPE) < 0);
-    return input;
-}
-
-PyrCommand calculate_command(KeyboardInput input)
-{
-    PyrCommand command;
-
-    // Space enables LOCAL command generation. It does not arm an aircraft
-    // If no space, return default zero-valued output directly
-    if (!input.enable_pressed)
-    {
-        return command;
-    }
-
-    const double roll_limit_deg = 10.0;
-    const double pitch_limit_deg = 10.0;
-    const double yaw_rate_limit_deg_s = 30.0;
-
-    command.roll_deg = axis_command(input.a_pressed, input.d_pressed, roll_limit_deg);
-    command.pitch_deg = axis_command(input.w_pressed, input.s_pressed, pitch_limit_deg);
-    command.yaw_rate_deg_s = axis_command(input.q_pressed, input.e_pressed, yaw_rate_limit_deg_s);
-    return command;
-}
-
-void display_command(KeyboardInput input, PyrCommand command)
-{
-    std::cout << "\rEnable: " << input.enable_pressed
-              << " Roll: "    << command.roll_deg
-              << " Pitch: "   << command.pitch_deg
-              << " Yaw rate: "<< command.yaw_rate_limit_deg_s
-              << "         "  << std::flush;
-}
-
-bool run_logic_checks()
-{
-    // Four combinations of a pair of opposite keys
-    bool axis_checks = axis_command(true, false, 10.0) == -10.0 &&
-                       axis_command(false, true, 10.0) == 10.0  &&
-                       axis_command(true, true, 10.0) == 0.0 &&
-                       axis_command(false, false, 10.0) == 0.0;
-
-    KeyboardInput sample;
-    sample.a_pressed = true;
-    sample.w_pressed = true;
-    sample.e_pressed = true;
-
-    PyrCommand disabled = calculate_command(sample);
-    bool disabled_check = disabled.roll_deg = 0.0 &&
-         disabled.pitch_deg = 0.0 && disabled.yaw_rate_deg_s = 0.0;
-
-    smaple.enable_pressed = true;
-    PyrCommand enabled = calculate_command(sample);
-    bool enabled_check = enabled.roll_deg == -10.0 &&
-         enabled.pitch_deg == -10.0 && enabled.yaw_rate_deg_s == 30.0;
-
-    std::cout << "Axis checks: " << axis_checks << '\n';
-    std::cout << "Disabled command check: " << disabled_check << '\n';
-    std::cout << "Enabled command check: " << enabled_check << '\n';
-    return axis_checks && disabled_check && enabled_check;
-}
